@@ -1,0 +1,72 @@
+{
+  "app": {
+    "package_name": "com.demo.app",
+    "app_name": "Demo App",
+    "platform": "android",
+    "app_version": "1.0.0",
+    "market_rank": 1,
+    "category": "demo"
+  },
+  "scan": {
+    "device_id": "local-device-001",
+    "os_version": "Android 14",
+    "script_version": "0.1.0",
+    "ai_model": "vision-model-name"
+  },
+  "pages": [
+    {
+      "page_key": "home",
+      "page_title": "首页",
+      "page_type": "home",
+      "screenshot": "screenshots/home.png",
+      "ocr_text": "搜索 推荐 消息 我的",
+      "ai_summary": "应用首页，包含推荐内容流和底部导航。",
+      "inferred_purpose": "承载主要浏览入口。",
+      "confidence": 0.92,
+      "normalized_payload": {
+        "layout_type": "bottom_tab_feed",
+        "regions": ["top_search", "content_feed", "bottom_tabs"]
+      },
+      "widgets": [
+        {
+          "widget_key": "search_entry",
+          "widget_type": "button",
+          "text": "搜索",
+          "semantic_name": "搜索入口",
+          "function_desc": "进入搜索页面",
+          "relative_position": "top",
+          "bbox": { "x": 24, "y": 48, "width": 312, "height": 48 },
+          "clickable": true,
+          "expected_result": "search",
+          "confidence": 0.91
+        }
+      ]
+    },
+    {
+      "page_key": "search",
+      "page_title": "搜索",
+      "page_type": "search",
+      "screenshot": "screenshots/search.png",
+      "ocr_text": "请输入关键词 热门搜索",
+      "ai_summary": "搜索页，包含输入框和热门搜索列表。",
+      "inferred_purpose": "帮助用户按关键词查找内容。",
+      "confidence": 0.9,
+      "normalized_payload": {
+        "layout_type": "search_list",
+        "regions": ["search_bar", "suggestions"]
+      },
+      "widgets": []
+    }
+  ],
+  "edges": [
+    {
+      "from_page_key": "home",
+      "to_page_key": "search",
+      "widget_key": "search_entry",
+      "label": "点击搜索入口",
+      "action_type": "tap",
+      "confidence": 0.9
+    }
+  ]
+}
+

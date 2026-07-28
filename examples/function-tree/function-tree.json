@@ -1,0 +1,88 @@
+{
+  "children": [
+    {
+      "name": "消息",
+      "level": 1,
+      "features": [
+        {
+          "sources": "QQ 官方能力目录",
+          "DESC": "查看消息和会话列表",
+          "type": "pageNavigation",
+          "gap": false,
+          "check": true,
+          "fault": null
+        }
+      ],
+      "children": [
+        {
+          "name": "单聊",
+          "level": 2,
+          "features": [
+            {
+              "sources": "消息功能",
+              "DESC": "点击会话进入单聊窗口",
+              "type": "pageNavigation",
+              "gap": false,
+              "check": true,
+              "fault": null
+            },
+            {
+              "sources": "消息功能",
+              "DESC": "长按消息打开操作面板",
+              "type": "popup",
+              "gap": false,
+              "check": true,
+              "fault": null
+            }
+          ],
+          "children": []
+        },
+        {
+          "name": "消息免打扰",
+          "level": 2,
+          "features": [
+            {
+              "sources": "消息设置",
+              "DESC": "切换消息免打扰状态",
+              "type": "state",
+              "gap": false,
+              "check": true,
+              "fault": null
+            }
+          ],
+          "children": []
+        }
+      ]
+    },
+    {
+      "name": "联系人",
+      "level": 1,
+      "features": [
+        {
+          "sources": "QQ 官方能力目录",
+          "DESC": "查看好友列表和好友资料",
+          "type": "pageNavigation",
+          "gap": false,
+          "check": true,
+          "fault": null
+        }
+      ],
+      "children": []
+    },
+    {
+      "name": "扫一扫",
+      "level": 1,
+      "features": [
+        {
+          "sources": "系统相机",
+          "DESC": "调用系统相机扫描二维码",
+          "type": "external",
+          "gap": false,
+          "check": false,
+          "fault": "需要相机权限"
+        }
+      ],
+      "children": []
+    }
+  ]
+}
