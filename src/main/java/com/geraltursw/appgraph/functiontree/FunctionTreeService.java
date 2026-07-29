@@ -31,6 +31,7 @@ import java.util.regex.Pattern;
 
 @Service
 public class FunctionTreeService {
+    private static final String POLICY_VERSION = "function-match-v2";
     private static final List<String> ACTION_LAYERS =
             List.of("popupAction", "stateAction", "externalAction", "pageNaviAction");
     private static final Pattern LATIN_TOKEN = Pattern.compile("[a-z0-9][a-z0-9._:/-]+");
@@ -232,20 +233,31 @@ public class FunctionTreeService {
                 .addValue("version", graphVersion).addValue("config", json.write(request)));
         try {
             var tokenIndex = buildIndex(context.functions());
+            var functionsById = new HashMap<UUID, Document>();
+            context.functions().forEach(function -> functionsById.put(function.id(), function));
+            Map<String, UUID> inheritedPages = request.resolvedEnableInheritance()
+                    ? loadInheritedBindings(context.appId(), runId, "page") : Map.of();
+            Map<String, UUID> inheritedActions = request.resolvedEnableInheritance()
+                    ? loadInheritedBindings(context.appId(), runId, "action") : Map.of();
             int pageBindings = 0;
             int actionBindings = 0;
             for (Document page : context.pages()) {
-                for (Scored scored : scoreCandidates(page, context.functions(), tokenIndex,
-                        request.resolvedTopK(), request.resolvedMinScore(), false)) {
+                var scored = scoreCandidates(page, context.functions(), tokenIndex,
+                        request.resolvedTopK(), request.resolvedMinScore(), false);
+                for (Decision decision : decideCandidates(
+                        page.id(), "page", scored, functionsById, inheritedPages, request)) {
                     jdbc.update("""
                             INSERT INTO function_page_bindings (
                                 binding_id, run_id, function_id, canonical_page_id,
-                                binding_source, match_score, match_evidence, review_status, is_primary
+                                binding_source, match_score, match_evidence, review_status, is_primary,
+                                second_best_score, score_margin, policy_version, decision_source,
+                                inherited_from
                             ) VALUES (
                                 :id, :runId, :functionId, :targetId,
-                                'rule', :score, :evidence::jsonb, :status, :primary
+                                :source, :score, :evidence::jsonb, :status, :primary,
+                                :secondBest, :margin, :policyVersion, :source, :inheritedFrom
                             )
-                            """, bindingParams(runId, page.id(), scored, request.resolvedAutoConfirmScore()));
+                            """, bindingParams(runId, page.id(), decision));
                     pageBindings++;
                 }
             }
@@ -253,32 +265,38 @@ public class FunctionTreeService {
             context.pages().forEach(page -> pageById.put(page.id(), page));
             for (Document action : context.actions()) {
                 Document sourcePage = pageById.get(action.parentId());
-                for (Scored scored : scoreActionCandidates(action, sourcePage, context.functions(), tokenIndex,
-                        request.resolvedTopK(), request.resolvedMinScore())) {
-                    var params = bindingParams(runId, action.id(), scored, request.resolvedAutoConfirmScore());
+                var scored = scoreActionCandidates(action, sourcePage, context.functions(), tokenIndex,
+                        request.resolvedTopK(), request.resolvedMinScore());
+                for (Decision decision : decideCandidates(
+                        action.id(), "action", scored, functionsById, inheritedActions, request)) {
+                    var params = bindingParams(runId, action.id(), decision);
                     params.addValue("role", capabilityRole(action.layer()));
                     jdbc.update("""
                             INSERT INTO function_action_bindings (
                                 binding_id, run_id, function_id, action_id, capability_role,
-                                binding_source, match_score, match_evidence, review_status, is_primary
+                                binding_source, match_score, match_evidence, review_status, is_primary,
+                                second_best_score, score_margin, policy_version, decision_source,
+                                inherited_from
                             ) VALUES (
                                 :id, :runId, :functionId, :targetId, :role,
-                                'rule', :score, :evidence::jsonb, :status, :primary
+                                :source, :score, :evidence::jsonb, :status, :primary,
+                                :secondBest, :margin, :policyVersion, :source, :inheritedFrom
                             )
                             """, params);
                     actionBindings++;
                 }
             }
-            var summary = Map.of(
-                    "functionCount", context.functions().size(),
-                    "pageCount", context.pages().size(),
-                    "actionCount", context.actions().size(),
-                    "pageBindingCount", pageBindings,
-                    "actionBindingCount", actionBindings,
-                    "aiReviewEnabled", Boolean.TRUE.equals(request.enableAiReview()),
-                    "aiReviewStatus", Boolean.TRUE.equals(request.enableAiReview())
-                            ? "providerNotConfiguredOrDeferred" : "disabled"
-            );
+            var summary = new LinkedHashMap<String, Object>();
+            summary.put("functionCount", context.functions().size());
+            summary.put("pageCount", context.pages().size());
+            summary.put("actionCount", context.actions().size());
+            summary.put("pageBindingCount", pageBindings);
+            summary.put("actionBindingCount", actionBindings);
+            summary.put("decisionCounts", decisionCounts(runId));
+            summary.put("policyVersion", POLICY_VERSION);
+            summary.put("aiReviewEnabled", Boolean.TRUE.equals(request.enableAiReview()));
+            summary.put("aiReviewStatus", Boolean.TRUE.equals(request.enableAiReview())
+                    ? "providerNotConfiguredOrDeferred" : "disabled");
             jdbc.update("""
                     UPDATE function_match_runs
                     SET status = 'completed', summary = :summary::jsonb, finished_at = now()
@@ -302,6 +320,17 @@ public class FunctionTreeService {
             throw new NotFoundException("Match run not found");
         }
         return Map.of("status", "success", "run", camelize(rows.getFirst()));
+    }
+
+    public Map<String, Object> runs(UUID catalogId) {
+        var rows = jdbc.queryForList("""
+                SELECT run_id, catalog_id, app_id, graph_version, status, config, summary,
+                       error_message, started_at, finished_at
+                FROM function_match_runs
+                WHERE catalog_id = :catalogId
+                ORDER BY started_at DESC
+                """, Map.of("catalogId", catalogId));
+        return Map.of("status", "success", "runs", camelizeRows(rows));
     }
 
     public Map<String, Object> bindings(UUID runId, String targetType, String reviewStatus) {
@@ -333,14 +362,65 @@ public class FunctionTreeService {
             }
             actionBindings.addAll(camelizeRows(jdbc.queryForList("""
                     SELECT b.*, f.name AS function_name, f.function_path,
-                           a.semantic_name AS action_name, a.action_layer, a.action_type
+                           a.semantic_name AS action_name, a.action_layer, a.action_type,
+                           p.display_name AS page_title, p.page_hash_id
                     FROM function_action_bindings b
                     JOIN function_nodes f ON f.function_id = b.function_id
                     JOIN page_actions a ON a.action_id = b.action_id
+                    JOIN canonical_pages p ON p.canonical_page_id = a.canonical_page_id
                     WHERE b.run_id = :runId
                     """ + filter + " ORDER BY b.match_score DESC", params)));
         }
         return Map.of("status", "success", "pageBindings", pageBindings, "actionBindings", actionBindings);
+    }
+
+    public Map<String, Object> coverage(UUID runId) {
+        runResult(runId);
+        var functions = camelizeRows(jdbc.queryForList("""
+                SELECT f.function_id, f.parent_function_id, f.name, f.function_path,
+                       f.automation_limited,
+                       coalesce(p.total, 0) AS page_total,
+                       coalesce(p.auto_confirmed, 0) AS page_auto_confirmed,
+                       coalesce(p.human_confirmed, 0) AS page_human_confirmed,
+                       coalesce(p.inherited, 0) AS page_inherited,
+                       coalesce(p.pending, 0) AS page_pending,
+                       coalesce(p.conflicted, 0) AS page_conflicted,
+                       coalesce(a.total, 0) AS action_total,
+                       coalesce(a.auto_confirmed, 0) AS action_auto_confirmed,
+                       coalesce(a.human_confirmed, 0) AS action_human_confirmed,
+                       coalesce(a.inherited, 0) AS action_inherited,
+                       coalesce(a.pending, 0) AS action_pending,
+                       coalesce(a.conflicted, 0) AS action_conflicted
+                FROM function_nodes f
+                LEFT JOIN (
+                    SELECT function_id, count(*) AS total,
+                           count(*) FILTER (WHERE review_status = 'autoConfirmed') AS auto_confirmed,
+                           count(*) FILTER (WHERE review_status IN ('humanConfirmed', 'confirmed')) AS human_confirmed,
+                           count(*) FILTER (WHERE review_status = 'inherited') AS inherited,
+                           count(*) FILTER (WHERE review_status IN ('pendingReview', 'suggested')) AS pending,
+                           count(*) FILTER (WHERE review_status = 'conflicted') AS conflicted
+                    FROM function_page_bindings WHERE run_id = :runId GROUP BY function_id
+                ) p ON p.function_id = f.function_id
+                LEFT JOIN (
+                    SELECT function_id, count(*) AS total,
+                           count(*) FILTER (WHERE review_status = 'autoConfirmed') AS auto_confirmed,
+                           count(*) FILTER (WHERE review_status IN ('humanConfirmed', 'confirmed')) AS human_confirmed,
+                           count(*) FILTER (WHERE review_status = 'inherited') AS inherited,
+                           count(*) FILTER (WHERE review_status IN ('pendingReview', 'suggested')) AS pending,
+                           count(*) FILTER (WHERE review_status = 'conflicted') AS conflicted
+                    FROM function_action_bindings WHERE run_id = :runId GROUP BY function_id
+                ) a ON a.function_id = f.function_id
+                WHERE f.catalog_id = (
+                    SELECT catalog_id FROM function_match_runs WHERE run_id = :runId
+                )
+                ORDER BY f.display_order
+                """, Map.of("runId", runId)));
+        return Map.of(
+                "status", "success",
+                "runId", runId,
+                "summary", decisionCounts(runId),
+                "functions", functions
+        );
     }
 
     @Transactional
@@ -348,21 +428,51 @@ public class FunctionTreeService {
         if (!Set.of("page", "action").contains(request.targetType())) {
             throw new IllegalArgumentException("targetType must be page or action");
         }
-        if (!Set.of("confirmed", "rejected", "suggested").contains(request.reviewStatus())) {
-            throw new IllegalArgumentException("reviewStatus is invalid");
-        }
+        String status = normalizeHumanReviewStatus(request.reviewStatus());
         String table = "page".equals(request.targetType())
                 ? "function_page_bindings" : "function_action_bindings";
         int count = jdbc.update("UPDATE " + table + """
-                SET review_status = :status, operator_note = :note
+                SET review_status = :status, decision_source = 'human',
+                    operator_note = :note, reviewed_by = :reviewedBy, reviewed_at = now()
                 WHERE binding_id = :id
-                """, Map.of("status", request.reviewStatus(),
-                "note", value(request.operatorNote()), "id", bindingId));
+                """, new MapSqlParameterSource()
+                .addValue("status", status).addValue("note", value(request.operatorNote()))
+                .addValue("reviewedBy", firstNonBlank(request.reviewedBy(), "demo-user"))
+                .addValue("id", bindingId));
         if (count == 0) {
             throw new NotFoundException("Binding not found");
         }
-        return Map.of("status", "success", "bindingId", bindingId,
-                "reviewStatus", request.reviewStatus());
+        return Map.of("status", "success", "bindingId", bindingId, "reviewStatus", status);
+    }
+
+    @Transactional
+    public Map<String, Object> reviewBatch(FunctionTreeController.BatchReviewRequest request) {
+        if (!Set.of("page", "action").contains(request.targetType())) {
+            throw new IllegalArgumentException("targetType must be page or action");
+        }
+        if (request.bindingIds().isEmpty()) {
+            throw new IllegalArgumentException("bindingIds must not be empty");
+        }
+        String status = normalizeHumanReviewStatus(request.reviewStatus());
+        String table = "page".equals(request.targetType())
+                ? "function_page_bindings" : "function_action_bindings";
+        int updated = jdbc.update("UPDATE " + table + """
+                SET review_status = :status, decision_source = 'human',
+                    operator_note = :note, reviewed_by = :reviewedBy, reviewed_at = now()
+                WHERE binding_id IN (:bindingIds)
+                """, new MapSqlParameterSource()
+                .addValue("status", status).addValue("note", value(request.operatorNote()))
+                .addValue("reviewedBy", firstNonBlank(request.reviewedBy(), "demo-user"))
+                .addValue("bindingIds", request.bindingIds()));
+        return Map.of("status", "success", "updated", updated, "reviewStatus", status);
+    }
+
+    private String normalizeHumanReviewStatus(String status) {
+        if ("confirmed".equals(status)) return "humanConfirmed";
+        if (!Set.of("humanConfirmed", "rejected").contains(status)) {
+            throw new IllegalArgumentException("reviewStatus is invalid");
+        }
+        return status;
     }
 
     @Transactional
@@ -375,26 +485,30 @@ public class FunctionTreeService {
             jdbc.update("""
                     INSERT INTO function_page_bindings (
                         binding_id, run_id, function_id, canonical_page_id, binding_source,
-                        match_score, match_evidence, review_status, is_primary, operator_note
+                        match_score, match_evidence, review_status, is_primary, operator_note,
+                        policy_version, decision_source, reviewed_by, reviewed_at
                     ) VALUES (
                         :id, :runId, :functionId, :targetId, 'manual',
-                        1, '{"reason":"manual binding"}'::jsonb, 'confirmed', true, :note
+                        1, '{"reason":"manual binding"}'::jsonb, 'humanConfirmed', true, :note,
+                        :policyVersion, 'manual', 'demo-user', now()
                     )
-                    """, manualParams(id, request));
+                    """, manualParams(id, request).addValue("policyVersion", POLICY_VERSION));
         } else {
             var params = manualParams(id, request)
                     .addValue("role", firstNonBlank(request.capabilityRole(), "behavior"));
             jdbc.update("""
                     INSERT INTO function_action_bindings (
                         binding_id, run_id, function_id, action_id, capability_role, binding_source,
-                        match_score, match_evidence, review_status, is_primary, operator_note
+                        match_score, match_evidence, review_status, is_primary, operator_note,
+                        policy_version, decision_source, reviewed_by, reviewed_at
                     ) VALUES (
                         :id, :runId, :functionId, :targetId, :role, 'manual',
-                        1, '{"reason":"manual binding"}'::jsonb, 'confirmed', true, :note
+                        1, '{"reason":"manual binding"}'::jsonb, 'humanConfirmed', true, :note,
+                        :policyVersion, 'manual', 'demo-user', now()
                     )
-                    """, params);
+                    """, params.addValue("policyVersion", POLICY_VERSION));
         }
-        return Map.of("status", "success", "bindingId", id, "reviewStatus", "confirmed");
+        return Map.of("status", "success", "bindingId", id, "reviewStatus", "humanConfirmed");
     }
 
     private Context loadContext(UUID catalogId, List<UUID> pageFilter, List<UUID> actionFilter) {
@@ -405,13 +519,16 @@ public class FunctionTreeService {
         }
         UUID appId = (UUID) catalog.getFirst().get("app_id");
         List<Document> functions = jdbc.query("""
-                SELECT function_id, name, description, function_path, match_rules, parent_function_id
+                SELECT function_id, vendor_function_id, name, description, function_path,
+                       match_rules, parent_function_id
                 FROM function_nodes WHERE catalog_id = :id ORDER BY display_order
                 """, Map.of("id", catalogId), (rs, row) -> {
             String text = String.join(" ", rs.getString("name"), rs.getString("description"),
                     rs.getString("function_path"), rs.getString("match_rules"));
+            var metadata = json.object(rs.getString("match_rules"));
+            metadata.put("vendorFunctionId", rs.getString("vendor_function_id"));
             return new Document(rs.getObject("function_id", UUID.class), null, rs.getString("name"),
-                    text, tokens(text), "", json.object(rs.getString("match_rules")));
+                    text, tokens(text), "", metadata);
         });
         var pageParams = new MapSqlParameterSource().addValue("appId", appId);
         String pageWhere = "";
@@ -501,6 +618,7 @@ public class FunctionTreeService {
         return functions.stream()
                 .filter(function -> candidates.contains(function.id()))
                 .map(function -> scoreAction(action, page, function))
+                .filter(scored -> Boolean.TRUE.equals(scored.evidence().get("eligible")))
                 .filter(scored -> scored.score() >= minScore)
                 .sorted(Comparator.comparingDouble(Scored::score).reversed())
                 .limit(topK)
@@ -523,10 +641,12 @@ public class FunctionTreeService {
         double sequence = trigramSimilarity(page.text(), function.text());
         boolean nameHit = page.text().toLowerCase(Locale.ROOT)
                 .contains(function.name().toLowerCase(Locale.ROOT));
-        double score = Math.min(1, coverage * 0.55 + sequence * 0.15 + (nameHit ? 0.30 : 0));
+        double rawScore = coverage * 0.55 + sequence * 0.15 + (nameHit ? 0.30 : 0);
+        double score = Math.min(1, rawScore / 0.55);
         return new Scored(function.id(), round(score), Map.of(
                 "matchedTerms", intersection(page.tokens(), function.tokens()),
                 "pageSimilarity", round(coverage), "sequenceSimilarity", round(sequence),
+                "rawScore", round(rawScore), "calibration", "raw/0.55",
                 "nameHit", nameHit, "reason", "Local lexical retrieval with Function Tree context"
         ));
     }
@@ -539,31 +659,149 @@ public class FunctionTreeService {
         boolean compatible = allowed.isEmpty() || allowed.contains(action.layer());
         boolean nameHit = action.text().toLowerCase(Locale.ROOT)
                 .contains(function.name().toLowerCase(Locale.ROOT));
-        double score = actionSimilarity * 0.40 + pageSimilarity * 0.25
-                + (compatible ? 0.20 : 0) + (nameHit ? 0.15 : 0);
-        if (!compatible) {
-            score *= 0.6;
-        }
-        return new Scored(function.id(), round(Math.min(1, score)), Map.of(
-                "matchedTerms", intersection(action.tokens(), function.tokens()),
-                "actionSimilarity", round(actionSimilarity), "pageSimilarity", round(pageSimilarity),
-                "layerCompatible", compatible, "actionLayer", action.layer(),
-                "reason", "Action semantics, source-page context and layer compatibility"
+        boolean semanticHit = actionSimilarity > 0 || nameHit;
+        boolean contextualHit = pageSimilarity >= 0.15;
+        boolean eligible = compatible && (semanticHit || contextualHit);
+        double rawScore = eligible
+                ? actionSimilarity * 0.50 + pageSimilarity * 0.20
+                    + (compatible ? 0.10 : 0) + (nameHit ? 0.20 : 0)
+                : 0;
+        double score = Math.min(1, rawScore / 0.80);
+        return new Scored(function.id(), round(score), Map.ofEntries(
+                Map.entry("matchedTerms", intersection(action.tokens(), function.tokens())),
+                Map.entry("actionSimilarity", round(actionSimilarity)),
+                Map.entry("pageSimilarity", round(pageSimilarity)),
+                Map.entry("layerCompatible", compatible),
+                Map.entry("semanticHit", semanticHit),
+                Map.entry("contextualHit", contextualHit),
+                Map.entry("eligible", eligible),
+                Map.entry("nameHit", nameHit),
+                Map.entry("rawScore", round(rawScore)),
+                Map.entry("calibration", "raw/0.80"),
+                Map.entry("actionLayer", action.layer()),
+                Map.entry("reason", "Action semantics, source-page context and layer compatibility")
         ));
     }
 
-    private MapSqlParameterSource bindingParams(
-            UUID runId,
+    private List<Decision> decideCandidates(
             UUID targetId,
-            Scored scored,
-            double autoConfirmScore
+            String targetType,
+            List<Scored> candidates,
+            Map<UUID, Document> functionsById,
+            Map<String, UUID> inherited,
+            FunctionTreeController.MatchRequest request
     ) {
+        if (candidates.isEmpty()) return List.of();
+        Scored best = candidates.getFirst();
+        double secondBest = candidates.size() > 1 ? candidates.get(1).score() : 0;
+        double margin = round(best.score() - secondBest);
+        double reviewScore = "action".equals(targetType)
+                ? request.resolvedActionReviewScore() : request.resolvedReviewScore();
+        double autoConfirmScore = "action".equals(targetType)
+                ? request.resolvedActionAutoConfirmScore() : request.resolvedAutoConfirmScore();
+        boolean conflict = candidates.size() > 1
+                && secondBest >= reviewScore
+                && margin < request.resolvedMinScoreMargin();
+
+        if (best.score() < reviewScore) return List.of();
+        if (conflict) {
+            var decisions = new ArrayList<Decision>();
+            for (int index = 0; index < candidates.size(); index++) {
+                Scored candidate = candidates.get(index);
+                if (candidate.score() < reviewScore
+                        || best.score() - candidate.score() >= request.resolvedMinScoreMargin()) {
+                    break;
+                }
+                decisions.add(new Decision(candidate, "conflicted", "policy",
+                        secondBest, margin, index == 0, null));
+            }
+            return decisions;
+        }
+
+        Document function = functionsById.get(best.functionId());
+        UUID inheritedFrom = inherited.get(inheritanceKey(targetId, function));
+        if (inheritedFrom != null) {
+            return List.of(new Decision(best, "inherited", "inherited",
+                    secondBest, margin, true, inheritedFrom));
+        }
+
+        boolean evidenceReady = autoConfirmEvidence(targetType, best.evidence());
+        String status = best.score() >= autoConfirmScore
+                && margin >= request.resolvedMinScoreMargin()
+                && evidenceReady
+                ? "autoConfirmed" : "pendingReview";
+        return List.of(new Decision(best, status, "policy", secondBest, margin, true, null));
+    }
+
+    private boolean autoConfirmEvidence(String targetType, Map<String, Object> evidence) {
+        if ("action".equals(targetType)) {
+            return Boolean.TRUE.equals(evidence.get("layerCompatible"))
+                    && Boolean.TRUE.equals(evidence.get("semanticHit"))
+                    && (Boolean.TRUE.equals(evidence.get("nameHit"))
+                        || number(evidence.get("actionSimilarity")) >= 0.25);
+        }
+        return Boolean.TRUE.equals(evidence.get("nameHit"))
+                || number(evidence.get("pageSimilarity")) >= 0.35;
+    }
+
+    private Map<String, UUID> loadInheritedBindings(UUID appId, UUID currentRunId, String targetType) {
+        String table = "action".equals(targetType)
+                ? "function_action_bindings" : "function_page_bindings";
+        String targetColumn = "action".equals(targetType) ? "action_id" : "canonical_page_id";
+        String sql = """
+                WITH previous_run AS (
+                    SELECT run_id
+                    FROM function_match_runs
+                    WHERE app_id = :appId AND run_id <> :currentRunId AND status = 'completed'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                )
+                SELECT b.binding_id, b.%s AS target_id, f.vendor_function_id
+                FROM %s b
+                JOIN previous_run r ON r.run_id = b.run_id
+                JOIN function_nodes f ON f.function_id = b.function_id
+                WHERE b.review_status IN ('autoConfirmed', 'humanConfirmed', 'inherited', 'confirmed')
+                ORDER BY b.match_score DESC
+                """.formatted(targetColumn, table);
+        var rows = jdbc.queryForList(sql, Map.of("appId", appId, "currentRunId", currentRunId));
+        var inherited = new LinkedHashMap<String, UUID>();
+        rows.forEach(row -> inherited.putIfAbsent(
+                row.get("target_id") + "|" + row.get("vendor_function_id"),
+                (UUID) row.get("binding_id")));
+        return inherited;
+    }
+
+    private String inheritanceKey(UUID targetId, Document function) {
+        return targetId + "|" + value(function.metadata().get("vendorFunctionId"));
+    }
+
+    private Map<String, Long> decisionCounts(UUID runId) {
+        var rows = jdbc.queryForList("""
+                SELECT review_status, count(*) AS binding_count
+                FROM (
+                    SELECT review_status FROM function_page_bindings WHERE run_id = :runId
+                    UNION ALL
+                    SELECT review_status FROM function_action_bindings WHERE run_id = :runId
+                ) bindings
+                GROUP BY review_status
+                """, Map.of("runId", runId));
+        var counts = new LinkedHashMap<String, Long>();
+        rows.forEach(row -> counts.put(
+                value(row.get("review_status")),
+                ((Number) row.get("binding_count")).longValue()));
+        return counts;
+    }
+
+    private MapSqlParameterSource bindingParams(UUID runId, UUID targetId, Decision decision) {
         return new MapSqlParameterSource()
                 .addValue("id", UUID.randomUUID()).addValue("runId", runId)
-                .addValue("functionId", scored.functionId()).addValue("targetId", targetId)
-                .addValue("score", scored.score()).addValue("evidence", json.write(scored.evidence()))
-                .addValue("status", scored.score() >= autoConfirmScore ? "confirmed" : "suggested")
-                .addValue("primary", false);
+                .addValue("functionId", decision.scored().functionId()).addValue("targetId", targetId)
+                .addValue("score", decision.scored().score())
+                .addValue("evidence", json.write(decision.scored().evidence()))
+                .addValue("status", decision.status()).addValue("primary", decision.primary())
+                .addValue("secondBest", decision.secondBest()).addValue("margin", decision.margin())
+                .addValue("policyVersion", POLICY_VERSION).addValue("source", decision.source())
+                .addValue("inheritedFrom", decision.inheritedFrom());
     }
 
     private MapSqlParameterSource manualParams(UUID id, FunctionTreeController.ManualBindingRequest request) {
@@ -892,6 +1130,10 @@ public class FunctionTreeService {
         return value == null ? "" : String.valueOf(value);
     }
 
+    private double number(Object value) {
+        return value instanceof Number number ? number.doubleValue() : 0;
+    }
+
     private String sha256(String value) {
         try {
             return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
@@ -929,6 +1171,17 @@ public class FunctionTreeService {
     }
 
     private record Scored(UUID functionId, double score, Map<String, Object> evidence) {
+    }
+
+    private record Decision(
+            Scored scored,
+            String status,
+            String source,
+            double secondBest,
+            double margin,
+            boolean primary,
+            UUID inheritedFrom
+    ) {
     }
 
     private record Context(

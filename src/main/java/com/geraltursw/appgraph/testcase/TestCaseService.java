@@ -375,8 +375,9 @@ public class TestCaseService {
             var functions = jdbc.query("""
                     SELECT function_id FROM function_action_bindings
                     WHERE run_id = :runId AND action_id = :actionId
-                      AND review_status IN ('confirmed', 'suggested')
-                    ORDER BY review_status = 'confirmed' DESC, match_score DESC LIMIT 1
+                      AND review_status IN ('autoConfirmed', 'humanConfirmed', 'inherited', 'confirmed')
+                    ORDER BY review_status IN ('humanConfirmed', 'confirmed') DESC,
+                             match_score DESC LIMIT 1
                     """, Map.of("runId", runId, "actionId", actionId),
                     (rs, row) -> rs.getObject(1, UUID.class));
             if (!functions.isEmpty()) return functions.getFirst();
@@ -384,8 +385,9 @@ public class TestCaseService {
         var functions = jdbc.query("""
                 SELECT function_id FROM function_page_bindings
                 WHERE run_id = :runId AND canonical_page_id = :pageId
-                  AND review_status IN ('confirmed', 'suggested')
-                ORDER BY review_status = 'confirmed' DESC, match_score DESC LIMIT 1
+                  AND review_status IN ('autoConfirmed', 'humanConfirmed', 'inherited', 'confirmed')
+                ORDER BY review_status IN ('humanConfirmed', 'confirmed') DESC,
+                         match_score DESC LIMIT 1
                 """, Map.of("runId", runId, "pageId", pageId),
                 (rs, row) -> rs.getObject(1, UUID.class));
         return functions.isEmpty() ? null : functions.getFirst();

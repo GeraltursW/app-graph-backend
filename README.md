@@ -38,8 +38,8 @@ $env:STORAGE_ROOT='D:\storage\app-graph-images'
 4. 验证：
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8080/health
-Invoke-RestMethod http://127.0.0.1:8080/appList
+Invoke-RestMethod http://127.0.0.1:8080/appGraph/health
+Invoke-RestMethod http://127.0.0.1:8080/appGraph/appList
 ```
 
 服务默认地址：`http://127.0.0.1:8080`。
@@ -64,7 +64,7 @@ Invoke-RestMethod `
   -Method Post `
   -ContentType 'application/json' `
   -Body $body `
-  http://127.0.0.1:8080/api/imports/scanFolder
+  http://127.0.0.1:8080/appGraph/api/imports/scanFolder
 ```
 
 导入器使用 `structureHash` 作为功能页面去重主信号。图片内容变化但结构相同的页面，会新增 `page_instances`，不会重复创建 `canonical_pages`。
@@ -73,25 +73,28 @@ Invoke-RestMethod `
 
 | 方法 | 地址 | 作用 |
 |---|---|---|
-| GET | `/health` | 服务健康检查 |
-| POST | `/api/imports/scanFolder` | 导入 AI JSON 与截图文件夹 |
-| GET | `/appList` | 应用列表与图节点数 |
-| GET | `/queryAppGraph/{appName}` | 查询递归图谱与游离页 |
-| POST | `/createOrphanNode` | 创建游离 URL |
-| POST | `/moveNode` | 调整父子关系 |
-| POST | `/deleteNode` | 删除页面节点 |
-| POST | `/updateNode` | multipart 更新页面、图片、AI 结论和四层动作 |
-| GET | `/image/{imageName}` | 读取本地截图 |
-| POST | `/api/functionTree/import` | 导入厂商元数据和 Function Tree |
-| POST | `/api/functionMatch/estimate` | 估算本地比较量与 AI 调用量 |
-| POST | `/api/functionMatch/run` | 执行页面/动作与功能点匹配 |
-| POST | `/api/testCases/generate` | 生成终点采集与过程采集用例 |
-| GET | `/api/testCases/{id}/scriptTask` | 输出脚本可执行任务 |
+| GET | `/appGraph/health` | 服务健康检查 |
+| POST | `/appGraph/api/imports/scanFolder` | 导入 AI JSON 与截图文件夹 |
+| GET | `/appGraph/appList` | 应用列表与图节点数 |
+| GET | `/appGraph/queryAppGraph/{appName}` | 查询递归图谱与游离页 |
+| POST | `/appGraph/createOrphanNode` | 创建游离 URL |
+| POST | `/appGraph/moveNode` | 调整父子关系 |
+| POST | `/appGraph/deleteNode` | 删除页面节点 |
+| POST | `/appGraph/updateNode` | multipart 更新页面、图片、AI 结论和四层动作 |
+| GET | `/appGraph/s3file/image?fileName=` | 读取本地/S3 兼容截图 |
+| POST | `/appGraph/api/functionTree/import` | 导入厂商元数据和 Function Tree |
+| POST | `/appGraph/api/functionMatch/estimate` | 估算本地比较量与 AI 调用量 |
+| POST | `/appGraph/api/functionMatch/run` | 执行页面/动作与功能点匹配 |
+| GET | `/appGraph/api/functionMatch/runs/{runId}/coverage` | 查询功能覆盖统计 |
+| POST | `/appGraph/api/functionBindings/reviewBatch` | 批量复核匹配候选 |
+| POST | `/appGraph/api/testCases/generate` | 生成终点采集与过程采集用例 |
+| GET | `/appGraph/api/testCases/{id}/scriptTask` | 输出脚本可执行任务 |
 
 ## 文档
 
 - [后端基础功能](docs/backend-basic-guide.md)
 - [Function Tree 结合方案](docs/function-tree-integration.md)
+- [Function Tree 端到端落地方案](docs/function-tree-end-to-end.md)
 - [用例生成方案](docs/test-case-generation.md)
 - [Python 到 Java 迁移说明](docs/python-to-java-migration.md)
 

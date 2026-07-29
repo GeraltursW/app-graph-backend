@@ -4,11 +4,13 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.Map;
 
 @RestController
+@RequestMapping("/appGraph")
 public class ImportController {
     private final ImportService service;
 
@@ -24,4 +26,3 @@ public class ImportController {
     public record FolderRequest(@NotBlank String folder) {
     }
 }
-

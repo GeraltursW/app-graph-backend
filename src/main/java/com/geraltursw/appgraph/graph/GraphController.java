@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestPart;
+import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -17,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 
 @RestController
+@RequestMapping("/appGraph")
 public class GraphController {
     private final GraphService service;
 
@@ -70,5 +72,9 @@ public class GraphController {
     public ResponseEntity<Resource> image(@PathVariable String imageName) {
         return service.image(imageName);
     }
-}
 
+    @GetMapping("/s3file/image")
+    public ResponseEntity<Resource> s3Image(@RequestParam String fileName) {
+        return service.image(fileName);
+    }
+}

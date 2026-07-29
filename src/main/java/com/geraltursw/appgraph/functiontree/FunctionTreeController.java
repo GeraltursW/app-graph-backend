@@ -14,6 +14,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestPart;
+import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -22,6 +23,7 @@ import java.util.Map;
 import java.util.UUID;
 
 @RestController
+@RequestMapping("/appGraph")
 public class FunctionTreeController {
     private final FunctionTreeService service;
 
@@ -64,6 +66,11 @@ public class FunctionTreeController {
         return service.runResult(runId);
     }
 
+    @GetMapping("/api/functionMatch/runs")
+    public Map<String, Object> runs(@RequestParam UUID catalogId) {
+        return service.runs(catalogId);
+    }
+
     @GetMapping("/api/functionMatch/runs/{runId}/bindings")
     public Map<String, Object> bindings(
             @PathVariable UUID runId,
@@ -73,12 +80,22 @@ public class FunctionTreeController {
         return service.bindings(runId, targetType, reviewStatus);
     }
 
+    @GetMapping("/api/functionMatch/runs/{runId}/coverage")
+    public Map<String, Object> coverage(@PathVariable UUID runId) {
+        return service.coverage(runId);
+    }
+
     @PostMapping("/api/functionBindings/{bindingId}/review")
     public Map<String, Object> review(
             @PathVariable UUID bindingId,
             @Valid @RequestBody ReviewRequest request
     ) {
         return service.review(bindingId, request);
+    }
+
+    @PostMapping("/api/functionBindings/reviewBatch")
+    public Map<String, Object> reviewBatch(@Valid @RequestBody BatchReviewRequest request) {
+        return service.reviewBatch(request);
     }
 
     @PostMapping("/api/functionBindings/manual")
@@ -91,8 +108,13 @@ public class FunctionTreeController {
             @Min(1) @Max(20) Integer topK,
             @DecimalMin("0") @DecimalMax("1") Double minScore,
             @DecimalMin("0") @DecimalMax("1") Double autoConfirmScore,
+            @DecimalMin("0") @DecimalMax("1") Double reviewScore,
+            @DecimalMin("0") @DecimalMax("1") Double actionAutoConfirmScore,
+            @DecimalMin("0") @DecimalMax("1") Double actionReviewScore,
+            @DecimalMin("0") @DecimalMax("1") Double minScoreMargin,
             @DecimalMin("0") @DecimalMax("1") Double aiReviewScore,
             Boolean enableAiReview,
+            Boolean enableInheritance,
             @Min(10) @Max(100) Integer aiBatchSize,
             List<UUID> pageIds,
             List<UUID> actionIds
@@ -108,12 +130,42 @@ public class FunctionTreeController {
         public double resolvedAutoConfirmScore() {
             return autoConfirmScore == null ? 0.85 : autoConfirmScore;
         }
+
+        public double resolvedReviewScore() {
+            return reviewScore == null ? 0.55 : reviewScore;
+        }
+
+        public double resolvedActionAutoConfirmScore() {
+            return actionAutoConfirmScore == null ? 0.90 : actionAutoConfirmScore;
+        }
+
+        public double resolvedActionReviewScore() {
+            return actionReviewScore == null ? 0.65 : actionReviewScore;
+        }
+
+        public double resolvedMinScoreMargin() {
+            return minScoreMargin == null ? 0.12 : minScoreMargin;
+        }
+
+        public boolean resolvedEnableInheritance() {
+            return enableInheritance == null || enableInheritance;
+        }
     }
 
     public record ReviewRequest(
             @NotBlank String targetType,
             @NotBlank String reviewStatus,
-            String operatorNote
+            String operatorNote,
+            String reviewedBy
+    ) {
+    }
+
+    public record BatchReviewRequest(
+            @NotBlank String targetType,
+            @NotBlank String reviewStatus,
+            @NotNull List<UUID> bindingIds,
+            String operatorNote,
+            String reviewedBy
     ) {
     }
 
@@ -127,4 +179,3 @@ public class FunctionTreeController {
     ) {
     }
 }
-
