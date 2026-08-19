@@ -6,6 +6,7 @@ import com.geraltursw.appgraph.common.NotFoundException;
 import com.geraltursw.appgraph.config.AppGraphProperties;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
+import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
@@ -15,11 +16,18 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
+import javax.imageio.ImageIO;
+import java.awt.Color;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.time.Instant;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -350,11 +358,7 @@ public class GraphService {
     }
 
     public ResponseEntity<Resource> image(String imageName) {
-        String safeName = Path.of(imageName).getFileName().toString();
-        Path imagePath = storageRoot.resolve(safeName).normalize();
-        if (!imagePath.startsWith(storageRoot) || !Files.isRegularFile(imagePath)) {
-            throw new NotFoundException("Image not found");
-        }
+        Path imagePath = resolveImage(imageName);
         String contentType;
         try {
             contentType = Files.probeContentType(imagePath);
@@ -364,6 +368,61 @@ public class GraphService {
         return ResponseEntity.ok()
                 .contentType(MediaType.parseMediaType(contentType == null ? "application/octet-stream" : contentType))
                 .body(new FileSystemResource(imagePath));
+    }
+
+    public ResponseEntity<Resource> thumbnail(String imageName, int requestedWidth) {
+        Path source = resolveImage(imageName);
+        int width = Math.max(80, Math.min(requestedWidth, 480));
+        String cacheName = source.getFileName().toString().replaceAll("[^a-zA-Z0-9._-]", "_")
+                + "-w" + width + ".jpg";
+        Path cacheDirectory = storageRoot.resolve(".thumbnails").normalize();
+        Path cached = cacheDirectory.resolve(cacheName).normalize();
+        if (!cached.startsWith(cacheDirectory)) {
+            throw new IllegalStateException("Invalid thumbnail cache path");
+        }
+        try {
+            if (!Files.isRegularFile(cached)
+                    || Files.getLastModifiedTime(cached).compareTo(Files.getLastModifiedTime(source)) < 0) {
+                BufferedImage original = ImageIO.read(source.toFile());
+                if (original == null || original.getWidth() <= width) {
+                    return image(imageName);
+                }
+                int height = Math.max(1, Math.round(original.getHeight() * (width / (float) original.getWidth())));
+                BufferedImage scaled = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+                Graphics2D graphics = scaled.createGraphics();
+                try {
+                    graphics.setColor(Color.WHITE);
+                    graphics.fillRect(0, 0, width, height);
+                    graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                    graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                    graphics.drawImage(original, 0, 0, width, height, null);
+                } finally {
+                    graphics.dispose();
+                }
+                Files.createDirectories(cacheDirectory);
+                Path temporary = cacheDirectory.resolve(cacheName + "." + UUID.randomUUID() + ".tmp");
+                if (!ImageIO.write(scaled, "jpg", temporary.toFile())) {
+                    Files.deleteIfExists(temporary);
+                    return image(imageName);
+                }
+                Files.move(temporary, cached, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException exception) {
+            throw new IllegalStateException("Unable to generate image thumbnail", exception);
+        }
+        return ResponseEntity.ok()
+                .cacheControl(CacheControl.maxAge(Duration.ofDays(7)).cachePublic())
+                .contentType(MediaType.IMAGE_JPEG)
+                .body(new FileSystemResource(cached));
+    }
+
+    private Path resolveImage(String imageName) {
+        String safeName = Path.of(imageName).getFileName().toString();
+        Path imagePath = storageRoot.resolve(safeName).normalize();
+        if (!imagePath.startsWith(storageRoot) || !Files.isRegularFile(imagePath)) {
+            throw new NotFoundException("Image not found");
+        }
+        return imagePath;
     }
 
     UUID findAppId(String appName) {

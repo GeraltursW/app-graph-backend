@@ -74,7 +74,10 @@ public class GraphController {
     }
 
     @GetMapping("/s3file/image")
-    public ResponseEntity<Resource> s3Image(@RequestParam String fileName) {
-        return service.image(fileName);
+    public ResponseEntity<Resource> s3Image(
+            @RequestParam String fileName,
+            @RequestParam(required = false) Integer width
+    ) {
+        return width == null ? service.image(fileName) : service.thumbnail(fileName, width);
     }
 }
