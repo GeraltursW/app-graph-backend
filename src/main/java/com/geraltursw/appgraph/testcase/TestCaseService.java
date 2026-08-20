@@ -65,8 +65,13 @@ public class TestCaseService {
                 collectRootToLeaf(root, graph.children(), new ArrayList<>(), new HashSet<>(), paths);
                 for (List<UUID> path : paths) {
                     persistTerminalCase(batchId, appId, path, graph, request.resolvedMetrics(),
-                            resolveFunction(request.functionMatchRunId(), path.getLast(), null));
+                            resolveFunction(request.functionMatchRunId(), path.getLast(), null), "scrollLoop");
                     terminalCases++;
+                    if (path.size() > 1) {
+                        persistTerminalCase(batchId, appId, path, graph, request.resolvedMetrics(),
+                                resolveFunction(request.functionMatchRunId(), path.getLast(), null), "backForwardLoop");
+                        terminalCases++;
+                    }
                 }
             }
         }
@@ -273,7 +278,8 @@ public class TestCaseService {
             List<UUID> path,
             Graph graph,
             List<String> metrics,
-            UUID functionId
+            UUID functionId,
+            String terminalPattern
     ) {
         var steps = new ArrayList<Map<String, Object>>();
         steps.add(Map.of("order", 0, "type", "resetApp", "description", "关闭后台并重新进入应用"));
@@ -297,12 +303,46 @@ public class TestCaseService {
         }
         Page root = graph.pages().get(path.getFirst());
         Page terminal = graph.pages().get(path.getLast());
+        int actionOrder = path.size() + 1;
+        if ("backForwardLoop".equals(terminalPattern)) {
+            Edge entryEdge = path.size() > 1
+                    ? findEdge(graph.edges(), path.get(path.size() - 2), path.getLast()) : null;
+            var action = new LinkedHashMap<String, Object>();
+            action.put("order", actionOrder++);
+            action.put("type", "performAction");
+            action.put("actionType", "backForwardLoop");
+            action.put("pageId", terminal.hashId());
+            action.put("description", "终点页面连续返回上一页并重新进入");
+            action.put("repeat", 3);
+            action.put("control", entryEdge == null ? "末级页面入口" : entryEdge.label());
+            action.put("collectDuringAction", true);
+            steps.add(action);
+        } else {
+            steps.add(Map.of(
+                    "order", actionOrder++, "type", "performAction", "actionType", "swipe",
+                    "pageId", terminal.hashId(), "description", "终点页面连续向上浏览",
+                    "direction", "up", "repeat", 4, "durationMs", 420,
+                    "collectDuringAction", true
+            ));
+            steps.add(Map.of(
+                    "order", actionOrder++, "type", "performAction", "actionType", "swipe",
+                    "pageId", terminal.hashId(), "description", "终点页面向下回滚",
+                    "direction", "down", "repeat", 3, "durationMs", 420,
+                    "collectDuringAction", true
+            ));
+        }
+        steps.add(Map.of(
+                "order", actionOrder, "type", "collect", "pageId", terminal.hashId(),
+                "description", "汇总终点动作窗口内的性能指标"
+        ));
+        String patternLabel = "backForwardLoop".equals(terminalPattern) ? "返回再进入" : "上下滑动";
         persistCase(batchId, appId, "terminalPath",
-                "全路径覆盖 · " + root.title() + " → " + terminal.title(),
+                "全路径覆盖 · " + root.title() + " → " + terminal.title() + " · " + patternLabel,
                 root.id(), terminal.id(), functionId, steps,
-                Map.of("phase", "terminal", "metrics", metrics, "startAfterFinalPageStable", true),
+                Map.of("phase", "terminalActions", "metrics", metrics,
+                        "terminalPattern", terminalPattern, "startAfterFinalPageStable", true),
                 Map.of("terminalPageId", terminal.hashId(), "terminalPageTitle", terminal.title(),
-                        "allStepsMustPass", true));
+                        "terminalPattern", terminalPattern, "allStepsMustPass", true));
     }
 
     private void persistScenarioCase(

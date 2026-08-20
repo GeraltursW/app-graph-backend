@@ -10,13 +10,17 @@
 首页 --消息--> 消息列表 --会话--> 聊天页
 ```
 
-每一条叶子路径生成一条独立用例。脚本按边上的控件说明依次操作，在最终页面稳定后开始采集功耗、CPU、内存、FPS 和网络数据。
+每一条叶子路径生成两条独立的首批用例。脚本按边上的控件说明依次到达终点，中间页面只做页面校验，不执行压力动作。所有典型操作和性能采集都集中在最终页面：
+
+- `scrollLoop`：终点页面向上连续滑动 4 次，再向下回滚 3 次。
+- `backForwardLoop`：从终点返回上一页，再通过原入口重新进入，连续执行 3 次。
 
 该策略强调：
 
 - 路径不能抽样。
 - 同一终点的不同到达路径分别保留。
 - 路径中任一步失败，终点数据不可视为有效。
+- 采集窗口从终点页面稳定后开始，覆盖完整终点动作，路径恢复耗时不计入结果。
 - 环或重复边通过路径 visited 集合阻断，避免无限生成。
 
 ### 1.2 过程采集用例
@@ -87,6 +91,24 @@ Content-Type: application/json
     "pageId": "message-hash",
     "actionType": "tap",
     "control": "消息列表"
+  },
+  {
+    "order": 3,
+    "type": "performAction",
+    "actionType": "swipe",
+    "pageId": "message-hash",
+    "direction": "up",
+    "repeat": 4,
+    "collectDuringAction": true
+  },
+  {
+    "order": 4,
+    "type": "performAction",
+    "actionType": "swipe",
+    "pageId": "message-hash",
+    "direction": "down",
+    "repeat": 3,
+    "collectDuringAction": true
   }
 ]
 ```
@@ -95,7 +117,8 @@ Content-Type: application/json
 
 ```json
 {
-  "phase": "terminal",
+  "phase": "terminalActions",
+  "terminalPattern": "scrollLoop",
   "metrics": ["power", "cpu", "memory"],
   "startAfterFinalPageStable": true
 }
@@ -195,4 +218,3 @@ GET /api/testCases/{testCaseId}/scriptTask
 - 历史覆盖去重：相同动作 fingerprint + 参数域 + App 版本不重复生成。
 
 当前代码实现基础组合与页面上限。优先级排序、参数域展开和历史覆盖去重是下一阶段增强点。
-
