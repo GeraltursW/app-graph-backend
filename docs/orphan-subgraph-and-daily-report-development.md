@@ -1,8 +1,16 @@
 # 游离子图归并与图谱建设日报开发文档
 
+> 状态：2026-09-07 已在独立 Java 仓库实施 V6 迁移、人工归并和日报接口。本文包含后续开发规格；真实已实现的表、接口及部署边界以 [实施与联调手册](./20260907-governance-implementation.md) 为准。尚未对生产 `app_page_graph` 单表执行迁移。
+
 ## 1. 开发范围
 
 本文定义后端、前端、脚本和数据库的实施契约。接口 JSON 统一使用 camelCase；PostgreSQL 列可以使用 snake_case，由 ORM 或 MyBatis 映射。
+
+生产业务数据契约以用户确认的 `app_page_graph` 和 `embedding_text` 为准。当前独立 Java 仓库迁移脚本使用 `canonical_pages/page_instances/page_edges`，是另一种存储实现；不能据此否认生产字段存在，也不能直接把本文 SQL 当成该仓库现有表迁移执行。
+
+落地时增加 `CoverageSourceRepository`，以真实业务库或经过显式字段映射的适配器提供 `appId/pageId/pageUrl/embeddingText`。生产适配器查询 `app_page_graph`；独立 Java 适配器必须先接入并持久化真实 `embeddingText`，不能将 `ai_summary` 当成同义字段。如果日报服务与图谱写入服务不在同一数据库事务中，写入侧需要事务事件表和幂等消费者，不能宣称跨服务写入处于一个本地事务。
+
+本期覆盖判定固定为：APP 有效、URL 非空，且任一关联节点的 `embedding_text` 非 NULL、去除空白后非空。`embedding_text` 不等于向量，图片换绑不改变 URL 身份。`firstCoverageTime` 采用服务端首次有效登记时间；设备的 `observedAt` 单独记录为证据，不用于回填或刷新该时间。
 
 本期新增模块：
 
@@ -26,15 +34,18 @@
 
 已有页面表应能够表达以下字段；实际表名按后端项目迁移脚本调整：
 
+下面 SQL 是生产单表模型的设计示例。正式发布应先回填旧节点状态并验证，再切换查询；不得把默认 `ORPHAN/UNCOVERED` 直接作为全部历史数据的真实状态。
+
 ```sql
 alter table app_page_graph
   add column if not exists structure_status varchar(24) not null default 'ORPHAN',
   add column if not exists coverage_status varchar(24) not null default 'UNCOVERED',
   add column if not exists resolved_at timestamptz,
   add column if not exists resolved_by varchar(128),
-  add column if not exists merge_source varchar(32),
-  add column if not exists graph_version bigint not null default 0;
+  add column if not exists merge_source varchar(32);
 ```
+
+`graphVersion` 属于 APP 级图谱，不放在每个页面上充当全图版本。单独的图版本记录按 APP 保存并在结构写入事务中锁定、校验和递增。
 
 `firstCoverageTime` 不建议只存页面节点，因为同一 URL 可以有多个节点。节点可以保留派生值用于展示，日报以 URL 事实表为准。
 
@@ -128,6 +139,7 @@ create table if not exists page_coverage_event (
   app_name varchar(128) not null,
   page_id varchar(64) not null,
   page_url text not null,
+  page_url_hash char(64) not null,
   event_type varchar(32) not null,
   source_type varchar(32) not null,
   covered_at timestamptz not null,
@@ -136,7 +148,7 @@ create table if not exists page_coverage_event (
 );
 
 create index if not exists idx_page_coverage_event_url_time
-  on page_coverage_event(app_name, page_url, covered_at);
+  on page_coverage_event(app_name, page_url_hash, covered_at);
 
 create table if not exists app_url_coverage_fact (
   id bigserial primary key,
@@ -161,12 +173,19 @@ create table if not exists app_url_coverage_fact (
 ```text
 begin transaction
   保存页面、截图、识别结果
-  if old.embeddingText 无效 and new.embeddingText 有效:
-    insert pageCoverageEvent
-    insert appUrlCoverageFact
+  if 写入后的 APP 有效 and URL 非空 and embeddingText 有效:
+    对目标 APP + URL 加锁或通过唯一约束竞争登记
+    insert appUrlCoverageFact（服务端登记时间）
       on conflict (appName, pageUrlHash) do nothing
+    校验冲突记录的 URL 原文一致，不更新已有 firstCoverageTime
+  if 节点有效覆盖状态或 URL 关联确实发生变化:
+    insert pageCoverageEvent（携带源事件 ID，幂等写入）
 commit
 ```
+
+例子：U 从图片 A 换到图片 B，U 的事实存在，因此时间不变。有效节点从 URL A 修改为 B 时，A 的历史保留；B 已有覆盖事实则保留原时间，B 从未覆盖才新登记。只存在 URL 占位而没有有效 `embedding_text` 时，不提前写入覆盖事实。
+
+覆盖事实记录的是历史首次成果；实时分子来自当前有效关联。删除最后一条有效关联可以降低当前覆盖数，但不能删除首次覆盖事实。用户当前以 APP 名称匹配，生产映射需保证名称唯一且受控；有稳定 APP 主键时，将其作为事实唯一键并保留名称用于展示，改名不得生成新覆盖。
 
 ### 2.6 日报快照
 
@@ -177,17 +196,36 @@ create table if not exists graph_daily_report (
   period_start timestamptz not null,
   period_end timestamptz not null,
   generated_at timestamptz not null,
+  revision integer not null default 1,
+  baseline_id varchar(64) not null,
+  metric_policy_version varchar(32) not null,
   timezone varchar(64) not null default 'Asia/Shanghai',
   summary jsonb not null,
   app_metrics jsonb not null,
-  unique (report_type, period_start, period_end)
+  url_details jsonb not null default '[]'::jsonb,
+  unique (report_type, period_start, period_end, revision)
 );
 
 create index if not exists idx_daily_report_period
   on graph_daily_report(period_end desc);
 ```
 
-同一期重复生成时更新快照，不创建重复趋势点。
+同一期主动重新生成时追加修订，不覆盖已经发布的内容；趋势按该期最新修订显示一个点。网络重试使用同一个请求幂等键，返回原修订。`urlDetails` 为生成时的明细快照，规模较大时拆为报告明细表或不可变对象存储文件。生成过程使用一致的数据库读快照，固定分母版本和口径版本。
+
+### 2.7 后台维护日报基准
+
+运行时不读取本地 Excel。后台维护以下实体，前端维护和系统同步都调用同一组服务：
+
+| 实体 | 必要字段 | 约束 |
+|---|---|---|
+| `reportBaseline` | baselineId、revision、status、source、updatedAt、publishedAt | DRAFT/PUBLISHED，发布后不可原地修改 |
+| `reportAppTarget` | baselineId、appId、appName、appGroups、totalUrlCount、specialNote | 每版本每 APP 一行，总数非负；TOP/TGI 可重叠，总览按 APP 去重 |
+| `reportPriorityUrl` | baselineId、appId、pageUrl、pageUrlHash | 每版本每 APP + URL 去重，保留完整原文 |
+| `reportSyncJob` | jobId、idempotencyKey、source、status、errors、baselineId | 批量同步失败不发布半份基准 |
+
+维护流程为“读取当前已发布版本 -> 编辑或同步生成草稿 -> 校验 -> 原子发布新版本”。报告查询实时使用最近成功发布的版本，展示来源和更新时间。后台不能自行推导厂商尚未提供的全量分母。
+
+如果只有全量 URL 数量，则保留计数覆盖口径，不能生成全量未覆盖 URL 明细；高频清单有逐条 URL，可以准确计算交集。未配置或分母为 0 时覆盖率返回 null，界面显示“—”；缺失 APP 和重复/冲突名称进入数据质量列表，不静默按 0 覆盖处理。当前分子按最新有效业务范围计算，历史首次事实跨版本保留，两者不可混用。
 
 ## 3. 边模型
 
@@ -214,6 +252,10 @@ create index if not exists idx_daily_report_period
 - 新边不能形成环。
 - 父子页面必须属于同一个 APP。
 - 每个结构变更必须生成新的 `graphVersion`。
+
+无环约束适用于所有新增图谱边，包括人工、脚本导入和批量自动归并。`A -> B -> D` 与 `A -> H -> D` 允许同时存在；`D -> A` 会形成环，应拒绝。返回、前进等执行动作可以记录在四层动作或脚本步骤中，但不绕过图谱无环约束。
+
+当前 `GraphService.moveNode` 会删除目标全部入边，批量归并不得直接循环调用该实现。请求应标明操作为 `ADD_ENTRY` 或 `REPLACE_ENTRY`；后者需要 `replacedEdgeId`，仅替换指定的归类边并保留其他已确认入口，审计保存完整受影响边集合。
 
 ## 4. 后端 API
 
@@ -363,6 +405,21 @@ GET  /appGraph/reports/{reportId}/exportHtml
 
 `generate` 返回固定统计区间、生成时刻、五项汇总和 APP 明细。
 
+基准维护接口（待实现）：
+
+```text
+GET  /appGraph/reports/baselines/current
+POST /appGraph/reports/baselines/createDraft
+POST /appGraph/reports/baselines/upsertAppTarget
+POST /appGraph/reports/baselines/upsertPriorityUrls
+POST /appGraph/reports/baselines/removePriorityUrls
+POST /appGraph/reports/baselines/publish
+POST /appGraph/reports/baselines/sync
+GET  /appGraph/reports/baselines/syncJobs/{jobId}
+```
+
+修改请求包含 `baselineId/expectedRevision`；应用配置含 `appId/appGroups/totalUrlCount/specialNote`，URL 清单项含 `appId/pageUrl`。发布执行完整校验和版本冲突检查；同步请求含源标识、幂等键和全量/增量模式，不能把未上传的增量项解释为删除。
+
 ## 5. 匹配服务实现
 
 ### 5.1 子图识别
@@ -372,6 +429,8 @@ GET  /appGraph/reports/{reportId}/exportHtml
 3. 在游离节点诱导子图中计算弱连通分量。
 4. 入度为 0 的节点作为入口候选。
 5. 多入口子图允许拆分或标记 `MULTI_ENTRY_REVIEW`。
+
+本系统禁止环。扫描发现历史循环数据时，将其标记为结构异常并停止自动接入，提示人工修复，不能静默删边。无环子图仍可能多入口：`B -> D <- C` 接入 B 后只能确认 B、D 可达，C 保持待处理。子图成员和入口集合需显式存储或在固定图版本上可重建，不能用一个 `entryPageId` 推断整组已完成。
 
 ### 5.2 候选召回
 
@@ -443,7 +502,7 @@ from url_status
 group by app_name;
 ```
 
-节点数另按有效页面记录行数统计，不能与 URL 数混用。
+节点数另按有效页面记录行数统计，不能与 URL 数混用。上述 SQL 对应生产 `app_page_graph` 适配器；独立 Java 模型须按标准页面去重后统计节点，不能把多张图片实例误计为多个功能节点。
 
 ### 6.3 覆盖率封顶
 
@@ -454,6 +513,8 @@ effectiveCovered = min(coveredUrlCount, totalUrlCount)
 ```
 
 表格可以显示实际覆盖数，但覆盖率最多为 100%，并提示分母或口径可能需要核查。
+
+分母来自已发布 `reportAppTarget`；高频覆盖通过当前有效 URL 集合与 `reportPriorityUrl` 精确求交集。总体覆盖率用分子之和除以分母之和，不平均各 APP 百分比。分母缺失或为 0 的应用不进入比例汇总，返回排除原因。去 0 口径还要求已覆盖数大于 0。封顶并不证明覆盖到了基准中的每条 URL，只有总数时界面需说明这是数量口径。
 
 ## 7. 前端开发
 
@@ -496,6 +557,8 @@ G6 图谱表现：
 - `a-table` 展示 11 列 APP 指标。
 - URL 明细使用 `a-drawer` 和虚拟滚动表格。
 - 点击 URL 调用图谱定位方法；多个页面节点匹配同一 URL 时显示候选列表。
+- 增加“基准维护”入口，支持 APP 分组、全量 URL 数量、高频 URL 清单维护、校验和发布。
+- 展示当前已发布基准版本、来源及更新时间；过往报告使用自身快照，实时图谱定位不到历史节点时说明节点已变更或删除。
 
 ## 8. 前端状态机
 
@@ -567,19 +630,22 @@ timestamp
 ### 11.3 日报
 
 - 北京时间早报、晚报区间边界不重复。
-- 同一期重复生成只更新一个趋势点。
+- 同一期新修订仍只展示一个最新趋势点，原报告内容可追溯。
 - URL 同时存在有效和无效节点时判为已覆盖。
 - 覆盖率封顶 100%，表格保留实际数量。
-- TOP/TGI 分组和 Excel 名称无法匹配时给出数据质量提示。
+- TOP/TGI 分组、应用映射和基准清单冲突时给出数据质量提示。
+- 无本地 Excel 文件时仍可维护基准和生成日报。
+- URL 从图片 A 转到 B、跨节点重新关联、重复上传时，已有首次覆盖时间不变。
+- 基准修改后，新报告使用新版本，历史报告分母和明细保持不变。
 - HTML 在无外网环境下可打开图表和明细。
 
 ## 12. 实施顺序
 
 ### 阶段 1：数据可信
 
-1. 增加探索步骤、覆盖事件、URL 覆盖事实和结构事件表。
-2. 改造上传和更新节点事务，正确登记 `firstCoverageTime`。
-3. 初始化历史基线。
+1. 确认生产 `embedding_text` 映射和所有写入入口，增加探索步骤、覆盖事件、URL 覆盖事实和结构事件表。
+2. 在受控写入暂停窗口内对历史有效 APP + URL 初始化基线，回填节点状态并核对总数。
+3. 部署并验证所有写入入口的幂等覆盖登记后恢复写入，记录启用时刻；不能暂停时另行设计增量切换与对账，不能跳过。
 
 ### 阶段 2：降低人工成本
 
@@ -595,7 +661,7 @@ timestamp
 
 ### 阶段 4：建设日报
 
-1. 导入 TOP/TGI、全量 URL 和高频 URL 配置。
+1. 实现 TOP/TGI、全量 URL 数量和高频 URL 清单的后台维护、同步及版本发布。
 2. 实现日报聚合、趋势快照和 URL 明细。
 3. 完成图谱定位和离线 HTML 导出。
 

@@ -65,6 +65,7 @@ public class ImportService {
                 packageName = "imported." + sha256(appName).substring(0, 16);
             }
             UUID appId = upsertApp(appNode, appName, packageName);
+            jdbc.queryForList("SELECT app_id FROM apps WHERE app_id=:id FOR UPDATE",Map.of("id",appId));
             UUID scanId = createScan(appId, payload.path("scan"));
             Files.createDirectories(storageRoot);
 
@@ -125,12 +126,12 @@ public class ImportService {
                             INSERT INTO page_instances (
                                 page_instance_id, scan_id, app_id, canonical_page_id, page_title,
                                 page_type, screenshot_hash, visual_hash, structure_hash, route_hash,
-                                ocr_text, ai_summary, inferred_purpose, page_url, images, action,
+                                ocr_text, ai_summary, inferred_purpose, page_url, embedding_text, images, action,
                                 ai_inference, ai_recursive, confidence, raw_ai_payload, normalized_payload
                             ) VALUES (
                                 :id, :scanId, :appId, :canonicalId, :title,
                                 :pageType, :screenshotHash, :visualHash, :structureHash, :routeHash,
-                                :ocrText, :summary, :purpose, :pageUrl, :images::jsonb, :action::jsonb,
+                                :ocrText, :summary, :purpose, :pageUrl, :embedding, :images::jsonb, :action::jsonb,
                                 :inference::jsonb, :recursive, :confidence, :raw::jsonb, :normalized::jsonb
                             )
                             """, new MapSqlParameterSource()
@@ -145,6 +146,7 @@ public class ImportService {
                             .addValue("summary", nullable(firstText(page, "pageText", "page_text", "aiSummary", "ai_summary")))
                             .addValue("purpose", nullable(firstText(page, "inferredPurpose", "inferred_purpose")))
                             .addValue("pageUrl", nullable(firstText(page, "pageUrl", "page_url", "url")))
+                            .addValue("embedding",nullable(firstText(page,"embeddingText","embedding_text")))
                             .addValue("images", json.write(images)).addValue("action", json.write(action))
                             .addValue("inference", json.write(nodeObject(page.path("aiInference").isMissingNode()
                                     ? page.path("ai_inference") : page.path("aiInference"))))

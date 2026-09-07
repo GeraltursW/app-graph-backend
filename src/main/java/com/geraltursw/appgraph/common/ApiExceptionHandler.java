@@ -11,6 +11,10 @@ import java.util.Map;
 
 @RestControllerAdvice
 public class ApiExceptionHandler {
+    @ExceptionHandler(org.springframework.dao.DataIntegrityViolationException.class)
+    public ResponseEntity<Map<String,Object>> integrity(org.springframework.dao.DataIntegrityViolationException exception) {
+        return error(HttpStatus.CONFLICT,"写入违反图谱无环、关联完整性或请求唯一约束，请刷新后重试");
+    }
     @ExceptionHandler(NotFoundException.class)
     public ResponseEntity<Map<String, Object>> notFound(NotFoundException exception) {
         return error(HttpStatus.NOT_FOUND, exception.getMessage());
@@ -34,4 +38,3 @@ public class ApiExceptionHandler {
         ));
     }
 }
-

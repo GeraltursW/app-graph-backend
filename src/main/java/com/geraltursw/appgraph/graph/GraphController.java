@@ -57,6 +57,7 @@ public class GraphController {
             @RequestParam String pageTitle,
             @RequestParam String pageText,
             @RequestParam String pageUrl,
+            @RequestParam(required = false) String embeddingText,
             @RequestParam(defaultValue = "") String widgetDescription,
             @RequestParam(defaultValue = "[]") String keepImages,
             @RequestParam(defaultValue = "{}") String aiInference,
@@ -64,7 +65,7 @@ public class GraphController {
             @RequestParam(defaultValue = "false") boolean aiRecursive,
             @RequestPart(required = false) List<MultipartFile> newImages
     ) {
-        return service.updateNode(pageId, pageTitle, pageText, pageUrl, widgetDescription,
+        return service.updateNode(pageId, pageTitle, pageText, pageUrl, embeddingText, widgetDescription,
                 keepImages, aiInference, action, aiRecursive, newImages);
     }
 

@@ -172,7 +172,13 @@ public class TestCaseService {
                     WHERE pi.canonical_page_id = p.canonical_page_id
                     ORDER BY pi.created_at DESC LIMIT 1
                 ) i ON true
-                WHERE p.app_id = :appId AND p.page_type <> 'orphan'
+                WHERE p.app_id = :appId AND p.canonical_page_id IN (
+                  WITH RECURSIVE reachable(id) AS (
+                    SELECT page_id FROM graph_entry_points WHERE app_id=:appId
+                    UNION SELECT e.to_canonical_page_id FROM page_edges e JOIN reachable r ON e.from_canonical_page_id=r.id
+                    WHERE e.app_id=:appId
+                  ) SELECT id FROM reachable
+                )
                 ORDER BY p.created_at
                 """, Map.of("appId", appId), rs -> {
             UUID id = rs.getObject("canonical_page_id", UUID.class);
@@ -201,7 +207,7 @@ public class TestCaseService {
                 incoming.add(edge.to());
             }
         }
-        List<UUID> roots = pages.keySet().stream().filter(id -> !incoming.contains(id)).toList();
+        List<UUID> roots = jdbc.queryForList("SELECT page_id FROM graph_entry_points WHERE app_id=:id",Map.of("id",appId),UUID.class).stream().filter(pages::containsKey).toList();
         var actions = new HashMap<UUID, List<Action>>();
         if (!layers.isEmpty()) {
             jdbc.query("""

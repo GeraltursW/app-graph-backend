@@ -13,6 +13,7 @@ import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -50,10 +51,12 @@ public class GraphService {
     private final NamedParameterJdbcTemplate jdbc;
     private final JsonSupport json;
     private final Path storageRoot;
+    private final GraphGovernanceService governance;
 
-    public GraphService(NamedParameterJdbcTemplate jdbc, JsonSupport json, AppGraphProperties properties) {
+    public GraphService(NamedParameterJdbcTemplate jdbc, JsonSupport json, AppGraphProperties properties, GraphGovernanceService governance) {
         this.jdbc = jdbc;
         this.json = json;
+        this.governance = governance;
         this.storageRoot = properties.storageRoot().toAbsolutePath().normalize();
     }
 
@@ -71,13 +74,14 @@ public class GraphService {
         return Map.of("status", "success", "apps", apps);
     }
 
+    @Transactional(readOnly=true, isolation=Isolation.REPEATABLE_READ)
     public Map<String, Object> queryGraph(String appName) {
         UUID appId = findAppId(appName);
         var rows = jdbc.query("""
                 SELECT p.canonical_page_id, p.page_hash_id, p.display_name, p.page_type,
                        p.primary_structure_hash, p.review_status,
                        i.ai_summary, i.page_url, i.images, i.action, i.ai_inference,
-                       i.ai_recursive, i.raw_ai_payload
+                       i.ai_recursive, i.raw_ai_payload, i.embedding_text
                 FROM canonical_pages p
                 LEFT JOIN LATERAL (
                     SELECT *
@@ -95,6 +99,7 @@ public class GraphService {
             node.put("pageId", rs.getString("page_hash_id"));
             node.put("pageTitle", rs.getString("display_name"));
             node.put("pageText", value(rs.getString("ai_summary")));
+            node.put("embeddingText", value(rs.getString("embedding_text")));
             node.put("images", json.array(rs.getString("images")));
             node.put("pageUrl", value(rs.getString("page_url")));
             node.put("aiInference", json.object(rs.getString("ai_inference")));
@@ -156,18 +161,21 @@ public class GraphService {
 
         var roots = new ArrayList<Map<String, Object>>();
         var orphanPages = new ArrayList<Map<String, Object>>();
-        for (var entry : byId.entrySet()) {
-            if (incoming.contains(entry.getKey())) {
-                continue;
-            }
-            Map<String, Object> tree = buildTree(entry.getKey(), byId, children, new LinkedHashSet<>());
-            @SuppressWarnings("unchecked")
-            var pageInfo = (Map<String, Object>) tree.get("pageInfo");
-            boolean orphan = "orphan".equals(pageInfo.get("pageType"))
-                    || Boolean.TRUE.equals(pageInfo.get("isOrphan"));
-            (orphan ? orphanPages : roots).add(tree);
-        }
-        return Map.of("roots", roots, "orphanPages", orphanPages);
+        var reached=governance.reachable(appId);
+        var entryIds=jdbc.queryForList("SELECT page_id FROM graph_entry_points WHERE app_id=:id",Map.of("id",appId),UUID.class);
+        var expanded = new HashSet<UUID>();
+        for(var id:entryIds) if(byId.containsKey(id)) roots.add(buildTree(id,byId,children,new LinkedHashSet<>(),expanded));
+        var orphanChildren=new LinkedHashMap<UUID,List<UUID>>();var orphanIncoming=new HashSet<UUID>();
+        children.forEach((from,tos)->{if(!reached.contains(from)){var filtered=tos.stream().filter(to->!reached.contains(to)).toList();orphanChildren.put(from,filtered);orphanIncoming.addAll(filtered);}});
+        for(var id:byId.keySet()) if(!reached.contains(id)&&!orphanIncoming.contains(id)) orphanPages.add(buildTree(id,byId,orphanChildren,new LinkedHashSet<>(),expanded));
+        var relations = edges.stream().filter(e -> byId.containsKey(e.get("from_canonical_page_id")) && byId.containsKey(e.get("to_canonical_page_id")))
+                .map(e -> Map.of("id", e.get("edge_id").toString(),
+                        "fromPageId", byId.get(e.get("from_canonical_page_id")).get("pageId"),
+                        "toPageId", byId.get(e.get("to_canonical_page_id")).get("pageId"),
+                        "widgetDescription", value(e.get("widget_description")),
+                        "label", value(e.get("label")), "actionType", value(e.get("action_type"))))
+                .toList();
+        return Map.of("roots", roots, "orphanPages", orphanPages,"edges",relations,"graphVersion",governance.version(appId));
     }
 
     @Transactional
@@ -228,6 +236,7 @@ public class GraphService {
         UUID pageId = (UUID) page.get("canonical_page_id");
         UUID parentId = (UUID) parent.get("canonical_page_id");
         UUID appId = (UUID) page.get("app_id");
+        jdbc.queryForList("SELECT app_id FROM apps WHERE app_id=:id FOR UPDATE",Map.of("id",appId));
         if (pageId.equals(parentId)) {
             throw new ConflictException("A node cannot be its own parent");
         }
@@ -237,6 +246,8 @@ public class GraphService {
         if (isDescendant(appId, pageId, parentId)) {
             throw new ConflictException("Cannot move a node under its descendant");
         }
+        Integer incomingCount=jdbc.queryForObject("SELECT count(*) FROM page_edges WHERE to_canonical_page_id=:id",Map.of("id",pageId),Integer.class);
+        if(incomingCount>1) throw new ConflictException("Multiple entry edges exist; use explicit edge editing instead of replacing all entries");
         jdbc.update("DELETE FROM page_edges WHERE to_canonical_page_id = :pageId",
                 Map.of("pageId", pageId));
         jdbc.update("""
@@ -281,6 +292,7 @@ public class GraphService {
             String pageTitle,
             String pageText,
             String pageUrl,
+            String embeddingText,
             String widgetDescription,
             String keepImagesJson,
             String aiInferenceJson,
@@ -321,13 +333,15 @@ public class GraphService {
                 UPDATE page_instances
                 SET page_title = :title, ai_summary = :text, page_url = :url,
                     images = :images::jsonb, action = :action::jsonb,
-                    ai_inference = :inference::jsonb, ai_recursive = :recursive
+                    ai_inference = :inference::jsonb, ai_recursive = :recursive,
+                    embedding_text = coalesce(:embedding, embedding_text)
                 WHERE page_instance_id = (
                     SELECT page_instance_id FROM page_instances
                     WHERE canonical_page_id = :id ORDER BY created_at DESC LIMIT 1
                 )
                 """, new MapSqlParameterSource()
                 .addValue("title", pageTitle).addValue("text", pageText).addValue("url", pageUrl)
+                .addValue("embedding",embeddingText,java.sql.Types.VARCHAR)
                 .addValue("images", json.write(finalImages)).addValue("action", json.write(normalizedAction))
                 .addValue("inference", json.write(inference)).addValue("recursive", aiRecursive)
                 .addValue("id", canonicalId));
@@ -348,6 +362,7 @@ public class GraphService {
         response.put("pageTitle", pageTitle);
         response.put("pageText", pageText);
         response.put("pageUrl", pageUrl);
+        if(embeddingText!=null) response.put("embeddingText",embeddingText);
         response.put("widgetDescription", widgetDescription);
         response.put("images", finalImages);
         response.put("action", normalizedAction);
@@ -491,7 +506,8 @@ public class GraphService {
             UUID id,
             Map<UUID, Map<String, Object>> nodes,
             Map<UUID, List<UUID>> children,
-            Set<UUID> path
+            Set<UUID> path,
+            Set<UUID> expanded
     ) {
         var result = new LinkedHashMap<>(nodes.get(id));
         result.remove("_canonicalId");
@@ -501,9 +517,14 @@ public class GraphService {
             result.put("cycleDetected", true);
             return result;
         }
+        // Shared DAG descendants are represented once; edges carry every alternate entry.
+        if (!expanded.add(id)) {
+            result.put("children", List.of());
+            return result;
+        }
         var nested = children.getOrDefault(id, List.of()).stream()
                 .distinct()
-                .map(child -> buildTree(child, nodes, children, new LinkedHashSet<>(path)))
+                .map(child -> buildTree(child, nodes, children, new LinkedHashSet<>(path), expanded))
                 .toList();
         result.put("children", nested);
         return result;
