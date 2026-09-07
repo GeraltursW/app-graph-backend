@@ -97,6 +97,7 @@ Invoke-RestMethod `
 - [Function Tree 端到端落地方案](docs/function-tree-end-to-end.md)
 - [用例生成方案](docs/test-case-generation.md)
 - [Python 到 Java 迁移说明](docs/python-to-java-migration.md)
+- [游离子图归并与图谱建设日报开发文档](docs/orphan-subgraph-and-daily-report-development.md)
 
 ## pgvector
 
